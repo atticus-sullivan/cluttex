@@ -133,6 +133,7 @@ Options:
       --bibtex=COMMAND+OPTIONs     Command for BibTeX, such as
                                      `bibtex' or `pbibtex'.
       --biber[=COMMAND+OPTIONs]    Command for Biber.
+      --sagetex[=COMMAND+OPTIONS]  Command for sagetex
       --makeglossaries[=COMMAND+OPTIONs]  Command for makeglossaries.
       --glossaries=[CONFIGURATION]  Configuration can contain
                                     "type:outputFile:inputFile:logFile:pathToCommand:commandArgs" (":" can be escaped with "\").
@@ -332,6 +333,11 @@ local option_spec = {
     long = "biber",
     param = true,
     default = "biber",
+  },
+  {
+    long = "sagetex",
+    param = true,
+    default = "sage",
   },
   {
     long = "makeglossaries",
@@ -540,6 +546,10 @@ local function handle_cluttex_options(arg)
       end
       local cfg = assert(parse_glossaries_option(param))
       table.insert(options.glossaries, cfg)
+
+    elseif name == "sagetex" then
+      assert(options.sagetex == nil, "multiple --sagetex options")
+      options.sagetex = param
 
     end
 
