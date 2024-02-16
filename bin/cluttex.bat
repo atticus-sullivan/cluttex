@@ -905,6 +905,13 @@ local function parse_recorder_file(file, options, filelist, filemap)
           if ext == "bbl" then
             kind = "auxiliary"
           end
+          if options.glossaries then
+            for _,i in ipairs(options.glossaries) do
+              if pathutil.basename(abspath) == i.out then
+                kind = "auxiliary"
+              end
+            end
+          end
           fileinfo = {path = path, abspath = abspath, kind = kind}
           table.insert(filelist, fileinfo)
           filemap[abspath] = fileinfo
@@ -934,9 +941,17 @@ local function parse_recorder_file(file, options, filelist, filemap)
           -- Treat .idx files (to be processed by MakeIndex) as auxiliary
           kind = "auxiliary"
           -- ...and .ind files
+        elseif options.glossaries then
+          for _,i in ipairs(options.glossaries) do
+            if pathutil.basename(abspath) == i.inp then
+              kind = "auxiliary"
+            end
+          end
         elseif ext == "bcf" then -- biber
           kind = "auxiliary"
         elseif ext == "glo" then -- makeglossaries
+          kind = "auxiliary"
+        elseif ext == "sage" then -- sagetex
           kind = "auxiliary"
         end
         fileinfo = {path = path, abspath = abspath, kind = kind}
@@ -1409,6 +1424,83 @@ local parseoption  = require "texrunner.option".parseoption
 local KnownEngines = require "texrunner.tex_engine"
 local message      = require "texrunner.message"
 
+local function split(opt)
+  local ret,builder,state = {},{},0
+  for c in opt:gmatch(".") do
+    if state == 0 then
+      if c == ":" then
+        table.insert(ret, table.concat(builder, ""))
+        builder = {}
+      elseif c == "\\" then
+        state = 1
+      else
+        table.insert(builder, c)
+      end
+
+    elseif state == 1 then
+      -- escaped
+      table.insert(builder, c)
+      state = 0
+    end
+  end
+  table.insert(ret, table.concat(builder, ""))
+  return ret
+end
+
+local function parse_glossaries_option(opt)
+  local s = split(opt)
+  if #s < 2 or #s > 6 then
+    return nil, "Error on splitting the glossaries parameter \""..opt.."\""
+  end
+
+  local ret = {}
+
+  ret.type = s[1]
+  if ret.type ~= "makeindex" and ret.type ~= "xindy" and (#s ~= 7 or s[5] == "") then
+    return nil, "Invalid glossaries parameter. \""..ret.type.."\" is unsupported"
+  end
+
+  ret.out = s[2]
+
+  if #s >= 3 and s[3] ~= "" then
+    ret.inp = s[3]
+  else
+    ret.inp = ret.out:sub(1,-2).."o"
+  end
+
+  if #s >= 4 and s[4] ~= "" then
+    ret.log = s[4]
+  else
+    ret.log = ret.out:sub(1,-2).."g"
+  end
+
+  if #s >= 5 and s[5] ~= "" then
+    ret.path = s[5]
+  else
+    ret.path = ret.type
+  end
+
+  ret.ist = pathutil.replaceext(ret.log, "ist")
+
+  if #s >= 6 then
+    ret.args = s[6]
+  else
+    if ret.type == "makeindex" then
+      ret.args = ("-s %s -t %s -o %s %s"):format(shellutil.escape(ret.ist), shellutil.escape(ret.log), shellutil.escape(ret.out), shellutil.escape(ret.inp))
+    elseif ret.type == "xindy" then
+      ret.args = ("-t %s -o %s %s"):format(shellutil.escape(ret.log), shellutil.escape(ret.out), shellutil.escape(ret.inp))
+    else
+      return nil, "Error on parsing the glossaries parameter \""..opt.."\""
+    end
+  end
+
+  -- build command
+  ret.cmd = ret.path.." "..ret.args
+
+  return ret
+end
+
+
 local function usage(arg)
   io.write(string.format([[
 ClutTeX: Process TeX files without cluttering your working directory
@@ -1435,8 +1527,9 @@ Options:
                                  cross-references.  [default: 3]
       --start-with-draft       Start with draft mode.
       --[no-]change-directory  Change directory before running TeX.
-      --watch                  Watch input files for change.  Requires fswatch
-                                 program to be installed.
+      --watch[=ENGINE]         Watch input files for change.  Requires fswatch
+                                 or inotifywait to be installed. ENGINE is one of
+                                 `fswatch', `inotifywait' or `auto' [default: `auto']
       --tex-option=OPTION      Pass OPTION to TeX as a single option.
       --tex-options=OPTIONs    Pass OPTIONs to TeX as multiple options.
       --dvipdfmx-option[s]=OPTION[s]  Same for dvipdfmx.
@@ -1445,7 +1538,24 @@ Options:
       --bibtex=COMMAND+OPTIONs     Command for BibTeX, such as
                                      `bibtex' or `pbibtex'.
       --biber[=COMMAND+OPTIONs]    Command for Biber.
+      --sagetex[=COMMAND+OPTIONS]  Command for sagetex
       --makeglossaries[=COMMAND+OPTIONs]  Command for makeglossaries.
+      --glossaries=[CONFIGURATION]  Configuration can contain
+                                    "type:outputFile:inputFile:logFile:pathToCommand:commandArgs" (":" can be escaped with "\").
+                                    Only the outputFile and either type or pathToCommand
+                                    are required, the other options will be infered
+                                    automatically (does not work always for inputFile and
+                                    logFile). If commandArgs is being specified,
+                                    these will be the only arguments passed to the
+                                    command. If type is unspecified commandArgs must be
+                                    specified. As types we support makeindex and xindy.
+                                    Specify this option multiple times to register multiple
+                                    glossaries. The default value works for a
+                                    configuration with the usual glossary (glo,gls,glg)
+                                    with a tex-file named "main.tex".
+                                    A typical example is
+                                    "makeindex:main.acr:main.acn:main.alg" or
+                                    "makeindex:main.glo:main.gls:main.glg" (default)
   -h, --help                   Print this message and exit.
   -v, --version                Print version information and exit.
   -V, --verbose                Be more verbose.
@@ -1510,6 +1620,8 @@ local option_spec = {
   },
   {
     long = "watch",
+    param = true,
+    default = "auto",
   },
   {
     short = "h",
@@ -1628,9 +1740,19 @@ local option_spec = {
     default = "biber",
   },
   {
+    long = "sagetex",
+    param = true,
+    default = "sage",
+  },
+  {
     long = "makeglossaries",
     param = true,
     default = "makeglossaries",
+  },
+  {
+    long = "glossaries",
+    param = true,
+    default = "makeindex:main.glo:main.gls:main.glg",
   },
 }
 
@@ -1700,7 +1822,7 @@ local function handle_cluttex_options(arg)
 
     elseif name == "watch" then
       assert(options.watch == nil, "multiple --watch options")
-      options.watch = true
+      options.watch = param
 
     elseif name == "help" then
       usage(arg)
@@ -1802,6 +1924,7 @@ local function handle_cluttex_options(arg)
       table.insert(options.dvipdfmx_extraoptions, param)
 
     elseif name == "makeindex" then
+      assert(not options.glossaries, "'makeindex' cannot be used together with 'glossaries'\nUse e.g. --glossaries='makeindex:main.ind:main.idx:main.ilg' instead of makeindex")
       assert(options.makeindex == nil, "multiple --makeindex options")
       options.makeindex = param
 
@@ -1816,10 +1939,25 @@ local function handle_cluttex_options(arg)
       options.biber = param
 
     elseif name == "makeglossaries" then
+      assert(not options.glossaries, "'makeglossaries' cannot be used together with 'glossaries'\nUse e.g. --glossaries='makeindex:main.glo:main.gls:main.glg' instead of makeglossaries")
       assert(options.makeglossaries == nil, "multiple --makeglossaries options")
       options.makeglossaries = param
 
+    elseif name == "glossaries" then
+      assert(not options.makeglossaries, "'glossaries' cannot be used together with 'makeglossaries'\nUse e.g. --glossaries='makeindex:main.glo:main.gls:main.glg' instead of makeglossaries")
+      assert(not options.makeindex, "'glossaries' cannot be used together with 'makeindex'\nUse e.g. --glossaries='makeindex:main.ind:main.idx:main.ilg' instead of makeindex")
+      if not options.glossaries then
+        options.glossaries = {}
+      end
+      local cfg = assert(parse_glossaries_option(param))
+      table.insert(options.glossaries, cfg)
+
+    elseif name == "sagetex" then
+      assert(options.sagetex == nil, "multiple --sagetex options")
+      options.sagetex = param
+
     end
+
   end
 
   if options.color == nil then
@@ -1857,6 +1995,15 @@ local function handle_cluttex_options(arg)
   end
 
   set_default_values(options)
+
+  -- parameter validy check TODO should this be organized as function like
+  -- set_default_values and with a key in the option spec (list or function)?
+  if options.watch then
+	  if options.watch ~= "fswatch" and options.watch ~= "inotifywait" then
+		message.error("Unknown wait engine '", options.watch, "'.")
+		os.exit(1)
+	  end
+  end
 
   if options.output_format == "pdf" then
     if options.check_driver ~= nil then
@@ -3069,9 +3216,11 @@ end
 local original_wd = filesys.currentdir()
 if options.change_directory then
   local TEXINPUTS = os.getenv("TEXINPUTS") or ""
+  local LUAINPUTS = os.getenv("LUAINPUTS") or ""
   assert(filesys.chdir(options.output_directory))
   options.output = pathutil.abspath(options.output, original_wd)
   os.setenv("TEXINPUTS", original_wd .. pathsep .. TEXINPUTS)
+  os.setenv("LUAINPUTS", original_wd .. pathsep .. LUAINPUTS)
   -- after changing the pwd, '.' is always the output_directory (needed for some path generation)
   options.output_directory = "."
 end
@@ -3317,6 +3466,28 @@ local function single_run(auxstatus, iteration)
     end
   end
 
+  if options.glossaries then
+    -- Look for configured files and run makeindex/xindy
+    for _,file in ipairs(filelist) do
+      for _, cfg in ipairs(options.glossaries) do
+        if pathutil.basename(file.path) == cfg.inp then
+          -- Run xindy/makeindex if the specified input-file is new or updated
+          local inputfileinfo = {path = file.path, abspath = file.abspath, kind = "auxiliary"}
+          local outputfile = cfg.out
+          if reruncheck.comparefileinfo({inputfileinfo}, auxstatus) or reruncheck.comparefiletime(file.abspath, cfg.inp, auxstatus) then
+            coroutine.yield(cfg.cmd)
+            table.insert(filelist, {path = outputfile, abspath = outputfile, kind = "auxiliary"})
+          else
+            local succ, err = filesys.touch(outputfile)
+            if not succ then
+              message.warn("Failed to touch " .. outputfile .. " (" .. err .. ")")
+            end
+          end
+        end
+      end
+    end
+  end
+
   if options.bibtex then
     local biblines2 = extract_bibtex_from_aux_file(mainauxfile, options.output_directory)
     local bibtex_aux_hash2
@@ -3324,7 +3495,7 @@ local function single_run(auxstatus, iteration)
       bibtex_aux_hash2 = md5.sum(table.concat(biblines2, "\n"))
     end
     local output_bbl = path_in_output_directory("bbl")
-    if bibtex_aux_hash ~= bibtex_aux_hash2 or reruncheck.comparefiletime(mainauxfile, output_bbl, auxstatus) then
+    if bibtex_aux_hash ~= bibtex_aux_hash2 or reruncheck.comparefiletime(pathutil.abspath(mainauxfile), output_bbl, auxstatus) then
       -- The input for BibTeX command has changed...
       local bibtex_command = {
         "cd", shellutil.escape(options.output_directory), "&&",
@@ -3343,18 +3514,41 @@ local function single_run(auxstatus, iteration)
     end
   elseif options.biber then
     for _,file in ipairs(filelist) do
+      -- usual compilation with biber
+      -- tex     -> pdflatex tex -> aux,bcf,pdf,run.xml
+      -- bcf     -> biber bcf    -> bbl
+      -- tex,bbl -> pdflatex tex -> aux,bcf,pdf,run.xml
       if pathutil.ext(file.path) == "bcf" then
         -- Run biber if the .bcf file is new or updated
         local bcffileinfo = {path = file.path, abspath = file.abspath, kind = "auxiliary"}
         local output_bbl = pathutil.replaceext(file.abspath, "bbl")
-        if reruncheck.comparefileinfo({bcffileinfo}, auxstatus) or reruncheck.comparefiletime(file.abspath, output_bbl, auxstatus) then
-          local bbl_dir = pathutil.dirname(file.abspath)
+        local updated_dot_bib = false
+        -- get the .bib files, the bcf uses as input
+        for l in io.lines(file.abspath) do
+            local bib = l:match("<bcf:datasource .*>(.*)</bcf:datasource>") -- might be unstable if biblatex adds e.g. a linebreak
+            if bib then
+              local bibfile = pathutil.join(original_wd, bib)
+              local succ, err = io.open(bibfile, "r") -- check if file is present, don't use touch to avoid triggering a rerun
+              if succ then
+                succ:close()
+                local updated_dot_bib_tmp = not reruncheck.comparefiletime(pathutil.abspath(mainauxfile), bibfile, auxstatus)
+                if updated_dot_bib_tmp then
+                    message.info(bibfile.." is newer than aux")
+                end
+                updated_dot_bib = updated_dot_bib_tmp or updated_dot_bib
+              else
+                message.warn(bibfile .. " is not accessible (" .. err .. ")")
+              end
+            end
+        end
+        if updated_dot_bib or reruncheck.comparefileinfo({bcffileinfo}, auxstatus) or reruncheck.comparefiletime(file.abspath, output_bbl, auxstatus) then
           local biber_command = {
             options.biber, -- Do not escape options.biber to allow additional options
             "--output-directory", shellutil.escape(options.output_directory),
             pathutil.basename(file.abspath)
           }
           coroutine.yield(table.concat(biber_command, " "))
+          -- watch for changes in the bbl
           table.insert(filelist, {path = output_bbl, abspath = output_bbl, kind = "auxiliary"})
         else
           local succ, err = filesys.touch(output_bbl)
@@ -3369,6 +3563,27 @@ local function single_run(auxstatus, iteration)
     if string.find(execlog, "No file [^\n]+%.bbl%.") then
       message.diag("You may want to use --bibtex or --biber option.")
     end
+  end
+
+  if options.sagetex then
+    for _,file in ipairs(filelist) do
+        if pathutil.ext(file.path) == "sage" then
+            local sagefileinfo = {path = file.path, abspath = file.abspath, kind = "auxiliary"}
+            if reruncheck.comparefileinfo({sagefileinfo}, auxstatus) then
+                local sage_command = {
+                    options.sagetex, -- Do not escape options.sagetex to allow additional options
+                    -- TODO handle output directory?
+                    pathutil.basename(file.abspath)
+                }
+                coroutine.yield(table.concat(sage_command, " "))
+            end
+        end
+    end
+  else
+      -- Check log file
+      if string.find(execlog, "Run Sage on") then
+          message.diag("You may want to use --sagetex option.")
+      end
   end
 
   if string.find(execlog, "No pages of output.") then
@@ -3517,7 +3732,7 @@ if options.watch then
       watcher:close()
       return true
     end
-  elseif shellutil.has_command("fswatch") then
+  elseif shellutil.has_command("fswatch") and (options.watch == "auto" or options.watch == "fswatch")  then
     if CLUTTEX_VERBOSITY >= 2 then
       message.info("Using `fswatch' command")
     end
@@ -3541,7 +3756,7 @@ if options.watch then
       end
       return false
     end
-  elseif shellutil.has_command("inotifywait") then
+  elseif shellutil.has_command("inotifywait") and (options.watch == "auto" or options.watch == "inotifywait") then
     if CLUTTEX_VERBOSITY >= 2 then
       message.info("Using `inotifywait' command")
     end
@@ -3566,7 +3781,13 @@ if options.watch then
       return false
     end
   else
-    message.error("Could not watch files because neither `fswatch' nor `inotifywait' was installed.")
+    if options.watch == "auto" then
+      message.error("Could not watch files because neither `fswatch' nor `inotifywait' was installed.")
+    elseif options.watch == "fswatch" then
+      message.error("Could not watch files because your selected engine `fswatch' was not installed.")
+    elseif options.watch == "inotifywait" then
+      message.error("Could not watch files because your selected engine `inotifywait' was not installed.")
+    end
     message.info("See ClutTeX's manual for details.")
     os.exit(1)
   end
